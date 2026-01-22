@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         12306 抢票助手 Pro(赵圳楠修改版)
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/Dr-Zhao1980/Tools/blob/main/%E6%B2%B9%E7%8C%B4%E8%84%9A%E6%9C%AC/12306%E6%8A%A2%E7%A5%A8.user.js
 // @version      1.2
 // @description  自动查票、下单
 // @author       赵圳楠
