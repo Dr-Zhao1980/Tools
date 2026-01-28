@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         12306抢票：drzhao高速稳定版
 // @namespace    https://github.com/Dr-Zhao1980/Tools/blob/main/%E6%B2%B9%E7%8C%B4%E8%84%9A%E6%9C%AC/12306%E6%8A%A2%E7%A5%A8.user.js
-// @version      1.4
-// @description  稳定版：这个脚本可以比较稳定的实现抢票，但是核心是数据必须保证互通，接受服务器数据返回之后才开始确认。同时添加了缓存机制
+// @version      1.6
+// @description  激进版：这个脚本可以比较激进的实现抢票，12306端没有发回信号就开始抢票了
 // @author       Dr_Zhao
 // @match        https://kyfw.12306.cn/otn/*
 // @grant        none
@@ -338,7 +338,7 @@
 
 //调试模式
         DEBUG: {
-            ENABLED: true,
+            ENABLED: false,
             TO_UI: true,
             TO_CONSOLE: true,
             MAX_QUEUE: 500,
