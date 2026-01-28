@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         12306抢票：drzhao高速稳定版
+// @name         12306抢票：drzhao高速激进版
 // @namespace    https://github.com/Dr-Zhao1980/Tools/blob/main/%E6%B2%B9%E7%8C%B4%E8%84%9A%E6%9C%AC/12306%E6%8A%A2%E7%A5%A8.user.js
 // @version      1.6
 // @description  激进版：这个脚本可以比较激进的实现抢票，12306端没有发回信号就开始抢票了
