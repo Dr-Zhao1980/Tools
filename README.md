@@ -82,10 +82,10 @@
 
 2. **安装脚本管理器扩展**:
    - **Tampermonkey**: 
-     - Firefox: 访问 [Firefox 扩展商店](https://addons.mozilla.org/firefox/addon/tampermonkey/)
-     - Chrome/Chromium: 访问 [Chrome 网上应用店](https://chrome.google.com/webstore/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
+     - Firefox: 在扩展商店搜索 "Tampermonkey" 或访问 [Firefox 扩展商店](https://addons.mozilla.org/firefox/addon/tampermonkey/)
+     - Chrome/Chromium: 在扩展商店搜索 "Tampermonkey"
    - **Greasemonkey** (仅Firefox): 
-     - 访问 [Firefox 扩展商店](https://addons.mozilla.org/firefox/addon/greasemonkey/)
+     - 在扩展商店搜索 "Greasemonkey" 或访问 [Firefox 扩展商店](https://addons.mozilla.org/firefox/addon/greasemonkey/)
 
 3. **安装用户脚本**:
    ```bash
@@ -119,7 +119,7 @@
    
    # 网络配置查看
    ip addr show
-   ifconfig
+   ifconfig  # 旧版命令，新系统可能需要: sudo apt install net-tools
    
    # 网络流量监控
    sudo apt install nethogs   # 进程网络监控
