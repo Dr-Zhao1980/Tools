@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         12306抢票：drzhao高速稳定版
+// @name         12306抢票：drzhao测试版本
 // @namespace    https://github.com/Dr-Zhao1980/Tools/blob/main/%E6%B2%B9%E7%8C%B4%E8%84%9A%E6%9C%AC/12306%E6%8A%A2%E7%A5%A8.user.js
 // @version      1.4
 // @description  稳定版：这个脚本可以比较稳定的实现抢票，但是核心是数据必须保证互通，接受服务器数据返回之后才开始确认。同时添加了缓存机制
@@ -54,7 +54,7 @@
              * 余票查询接口（相对路径）
              * 示例：/otn/leftTicket/query?leftTicketDTO.train_date=...
              */
-            QUERY_URL: '/otn/leftTicket/query',
+            QUERY_URL: '/otn/leftTicket/queryG',
             /**
              * 请求头 Referer
              * - 有些接口需要正确的 Referer 才能通过校验
@@ -67,6 +67,14 @@
             HOST: 'kyfw.12306.cn',
             FETCH_KEEPALIVE: true,
             FETCH_PRIORITY: 'high'
+        },
+
+        QUERY: {
+            INCLUDE_PREV_DAY_DEFAULT: true
+        },
+
+        CANDIDATE: {
+            ENABLED_DEFAULT: false
         },
 
         //=====================================================================所有的网络请求===========================================================
@@ -212,7 +220,11 @@
         TIME_SYNC: {
             SAMPLE_COUNT: 5,
             SAMPLE_INTERVAL_MS: 120,
-            RESYNC_EVERY_MS: 30000
+            RESYNC_EVERY_MS: 30000,
+            RESYNC_FAST_WITHIN_MS: 10000,
+            RESYNC_FAST_EVERY_MS: 5000,
+            SMOOTH_ALPHA: 0.2,
+            OUTLIER_THRESHOLD_MS: 800
         },
 
         //=====================================================================所有的预热===========================================================
@@ -417,6 +429,9 @@
                 if (typeof UIModule !== 'undefined' && UIModule.log) {
                     UIModule.log(`站点简码表加载完成，共 ${count} 个站点`, 'success');
                 }
+                if (typeof window !== 'undefined' && typeof window.__th_update_station_list === 'function') {
+                    window.__th_update_station_list();
+                }
             }
         } catch (e) {
             console.error('获取站点简码表失败:', e);
@@ -432,6 +447,8 @@
     let timeOffset = 0; // 本地时间与服务器时间的偏移量 (ms)
     let lastTimeSyncAt = 0;
     let lastTimeSyncRtt = null;
+    let timeBaseServerMs = null;
+    let timeBasePerfMs = null;
 
     /**
      * @description 同步服务器时间，计算本地与服务器的时间差
@@ -456,7 +473,9 @@
                     const rtt = t1 - t0;
                     const estimatedServerTime = serverTime + (rtt / 2);
                     const offset = estimatedServerTime - t1Abs;
-                    results.push({ offset, rtt, serverTime, t1Abs });
+                    const offsetLow = offset;
+                    const offsetHigh = offset + 999;
+                    results.push({ offset, offsetLow, offsetHigh, rtt, serverTime, t1Abs });
                 }
 
                 if (sampleInterval > 0 && i < sampleCount - 1) {
@@ -467,8 +486,47 @@
             if (results.length > 0) {
                 results.sort((a, b) => a.rtt - b.rtt);
                 const best = results[0];
-                timeOffset = best.offset;
-                lastTimeSyncAt = Date.now();
+                const threshold = (CONFIG.TIME_SYNC && typeof CONFIG.TIME_SYNC.OUTLIER_THRESHOLD_MS === 'number') ? CONFIG.TIME_SYNC.OUTLIER_THRESHOLD_MS : null;
+                const alpha = (CONFIG.TIME_SYNC && typeof CONFIG.TIME_SYNC.SMOOTH_ALPHA === 'number') ? CONFIG.TIME_SYNC.SMOOTH_ALPHA : null;
+
+                let newOffset = best.offset;
+                let intersectLow = null;
+                let intersectHigh = null;
+                for (let i = 0; i < results.length; i++) {
+                    const r = results[i];
+                    if (typeof r.offsetLow !== 'number' || typeof r.offsetHigh !== 'number') continue;
+                    intersectLow = (intersectLow === null) ? r.offsetLow : Math.max(intersectLow, r.offsetLow);
+                    intersectHigh = (intersectHigh === null) ? r.offsetHigh : Math.min(intersectHigh, r.offsetHigh);
+                }
+                if (intersectLow !== null && intersectHigh !== null && intersectLow <= intersectHigh) {
+                    newOffset = (intersectLow + intersectHigh) / 2;
+                }
+                if (lastTimeSyncAt > 0 && typeof threshold === 'number' && threshold > 0) {
+                    if (Math.abs(newOffset - timeOffset) > threshold) {
+                        if (CONFIG.DEBUG && CONFIG.DEBUG.ENABLED) {
+                            DebugModule.log('TIME_SYNC_OUTLIER_DROP', {
+                                samples: results.length,
+                                bestRttMs: Math.round(best.rtt * 1000) / 1000,
+                                bestOffsetMs: Math.round(best.offset * 1000) / 1000,
+                                currentOffsetMs: Math.round(timeOffset * 1000) / 1000,
+                                thresholdMs: threshold
+                            }, 'warn');
+                        }
+                        return;
+                    }
+                }
+
+                if (lastTimeSyncAt > 0 && typeof alpha === 'number' && alpha > 0 && alpha < 1) {
+                    timeOffset = (timeOffset * (1 - alpha)) + (newOffset * alpha);
+                } else {
+                    timeOffset = newOffset;
+                }
+
+                const nowAbs = Date.now();
+                const nowPerf = (typeof performance !== 'undefined' && performance.now) ? performance.now() : nowAbs;
+                timeBaseServerMs = nowAbs + timeOffset;
+                timeBasePerfMs = nowPerf;
+                lastTimeSyncAt = nowAbs;
                 lastTimeSyncRtt = best.rtt;
                 console.log(`[TimeSync] 时间同步完成，本地落后/超前: ${timeOffset}ms (rtt=${Math.round(best.rtt * 10) / 10}ms, samples=${results.length})`);
                 if (typeof UIModule !== 'undefined' && UIModule.log) {
@@ -479,6 +537,8 @@
                         samples: results.length,
                         bestRttMs: Math.round(best.rtt * 1000) / 1000,
                         bestOffsetMs: Math.round(best.offset * 1000) / 1000,
+                        offsetMs: Math.round(timeOffset * 1000) / 1000,
+                        intervalMs: (intersectLow !== null && intersectHigh !== null && intersectLow <= intersectHigh) ? Math.round((intersectHigh - intersectLow) * 1000) / 1000 : null,
                         rttsMs: results.map(x => Math.round(x.rtt * 1000) / 1000),
                         offsetsMs: results.map(x => Math.round(x.offset * 1000) / 1000)
                     }, 'info');
@@ -497,6 +557,10 @@
      * @returns {Date} 修正后的时间对象
      */
     function getServerTime() {
+        if (timeBaseServerMs !== null && timeBasePerfMs !== null && typeof performance !== 'undefined' && performance.now) {
+            const nowPerf = performance.now();
+            return new Date(timeBaseServerMs + (nowPerf - timeBasePerfMs));
+        }
         return new Date(Date.now() + timeOffset);
     }
 
@@ -540,6 +604,12 @@
 
         function computeTargetServerMs(startTimeStr, serverNow) {
             if (!startTimeStr) return null;
+            const raw = String(startTimeStr).trim();
+            if (raw.indexOf('T') !== -1 || raw.indexOf('-') !== -1) {
+                const norm = raw.indexOf('T') !== -1 ? raw : raw.replace(' ', 'T');
+                const ms = new Date(norm).getTime();
+                if (!Number.isNaN(ms)) return ms;
+            }
             const parts = String(startTimeStr).split(':').map(Number);
             if (parts.length < 2) return null;
             const h = parts[0], m = parts[1], s = parts[2] || 0;
@@ -696,7 +766,30 @@
                     'leftTicketDTO.to_station': toStation,
                     'purpose_codes': purposeCodes
                 });
-                return request(`${QUERY_URL}?${params.toString()}`);
+
+                const doQuery = async (url) => {
+                    const data = await request(`${url}?${params.toString()}`);
+                    if (data && typeof data.c_url === 'string' && data.c_url) {
+                        const cu = data.c_url.startsWith('/otn/') ? data.c_url : `/otn/leftTicket/${data.c_url}`;
+                        if (cu !== QUERY_URL) {
+                            QUERY_URL = cu;
+                        }
+                    }
+                    return data;
+                };
+
+                const primary = await doQuery(QUERY_URL);
+                if (primary && primary.status === false) {
+                    const fallbackUrl = '/otn/leftTicket/queryG';
+                    if (QUERY_URL !== fallbackUrl) {
+                        const fallback = await doQuery(fallbackUrl);
+                        if (fallback && fallback.status !== false) {
+                            QUERY_URL = fallbackUrl;
+                            return fallback;
+                        }
+                    }
+                }
+                return primary;
             },
             /**
              * @description 提交预订请求 (下单第一步)
@@ -719,6 +812,62 @@
                     'undefined': ''
                 });
                 return request('/otn/leftTicket/submitOrderRequest', { method: 'POST', body: body });
+            },
+
+            async submitOrderRequestHb(secretList) {
+                const body = new URLSearchParams({
+                    'secretList': secretList,
+                    '_json_att': ''
+                });
+                return request('/otn/afterNate/submitOrderRequest', { method: 'POST', body: body });
+            },
+
+            async chechFace(secretList) {
+                const body = new URLSearchParams({
+                    'secretList': secretList,
+                    '_json_att': ''
+                });
+                return request('/otn/afterNate/chechFace', { method: 'POST', body: body });
+            },
+
+            async passengerInitApi() {
+                return request('/otn/afterNate/passengerInitApi', { method: 'POST' });
+            },
+
+            async confirmHB(params) {
+                const body = new URLSearchParams({
+                    'passengerInfo': params.passengerInfo || '',
+                    'jzParam': params.jzParam || '',
+                    'hbTrain': params.hbTrain || '',
+                    'lkParam': params.lkParam || '',
+                    'sessionId': params.sessionId || '',
+                    'sig': params.sig || '',
+                    'scene': params.scene || 'nc_login',
+                    'encryptedData': params.encryptedData || '',
+                    'if_receive_wseat': params.if_receive_wseat || 'N',
+                    'realize_limit_time_diff': params.realize_limit_time_diff || '360',
+                    'plans': params.plans || '',
+                    'tmp_train_date': params.tmp_train_date || '',
+                    'tmp_train_time': params.tmp_train_time || '',
+                    'add_train_flag': params.add_train_flag || 'N',
+                    'add_train_seat_type_code': params.add_train_seat_type_code || ''
+                });
+                return request('/otn/afterNate/confirmHB', {
+                    method: 'POST',
+                    body: body,
+                    headers: {
+                        'Referer': 'https://kyfw.12306.cn/otn/view/lineUp_toPay.html'
+                    }
+                });
+            },
+
+            async queryQueue() {
+                return request('/otn/afterNate/queryQueue', {
+                    method: 'POST',
+                    headers: {
+                        'Referer': 'https://kyfw.12306.cn/otn/view/lineUp_toPay.html'
+                    }
+                });
             },
             /**
              * @description 获取下单页面初始化 HTML (下单第二步)
@@ -837,6 +986,11 @@
             '软卧': 23, '硬卧': 28, '硬座': 29, '无座': 26
         };
 
+        function isCandidateStock(stockStr) {
+            if (!stockStr) return false;
+            return String(stockStr).indexOf('候补') !== -1;
+        }
+
         /**
          * @description 解析单条车次原始数据字符串
          * @param {string} rawString - 12306 返回的原始字符串 (以 | 分隔)
@@ -930,7 +1084,60 @@
                                 toStation: parts[7],
                                 seatName: seatName,
                                 leftTicket: parts[12],
-                                trainLocation: parts[15]
+                                trainLocation: parts[15],
+                                stockStr
+                            };
+                        }
+                    }
+                }
+                return null;
+            },
+
+            findCandidateTrain(resultList, targetTrainCode, targetSeats = ['二等座']) {
+                if (!resultList || !Array.isArray(resultList) || resultList.length === 0) return null;
+
+                const targetCodeUpper = String(targetTrainCode || '').toUpperCase();
+                if (!targetCodeUpper) return null;
+
+                const seatIndexList = [];
+                for (let i = 0; i < targetSeats.length; i++) {
+                    const seatName = targetSeats[i];
+                    const idx = SEAT_INDEX_MAP[seatName];
+                    if (typeof idx === 'number') seatIndexList.push({ seatName, idx });
+                }
+                if (seatIndexList.length === 0) return null;
+
+                for (let i = 0, len = resultList.length; i < len; i++) {
+                    const raw = resultList[i];
+                    if (!raw) continue;
+                    if (raw.indexOf(targetCodeUpper) === -1) continue;
+
+                    const parts = raw.split('|');
+                    if (parts.length < 30) continue;
+
+                    const trainCode = parts[3];
+                    if (!trainCode || trainCode.toUpperCase() !== targetCodeUpper) continue;
+                    if (parts[11] !== 'Y') continue;
+
+                    for (let j = 0; j < seatIndexList.length; j++) {
+                        const seatName = seatIndexList[j].seatName;
+                        const idx = seatIndexList[j].idx;
+                        const stockStr = parts[idx] || '';
+                        if (!hasTicket(stockStr) && isCandidateStock(stockStr)) {
+                            return {
+                                secretStr: parts[0],
+                                trainDate: parts[13],
+                                trainNo: parts[2],
+                                trainCode: parts[3],
+                                fromStation: parts[6],
+                                toStation: parts[7],
+                                startTime: parts[8],
+                                endTime: parts[9],
+                                seatName: seatName,
+                                leftTicket: parts[12],
+                                trainLocation: parts[15],
+                                stockStr,
+                                isCandidate: true
                             };
                         }
                     }
@@ -1300,10 +1507,13 @@
                     trainDate: config.trainDate,
                     fromStation: config.fromStation,
                     toStation: config.toStation,
+                    fromStationName: config.fromStationName,
+                    toStationName: config.toStationName,
                     trainCodes: config.trainCodes,
                     seatTypes: config.seatTypes,
                     passengers: config.passengers,
                     startTime: config.startTime,
+                    candidateEnabled: config.candidateEnabled,
                     timestamp: Date.now()
                 };
                 localStorage.setItem(CACHE_KEY, JSON.stringify(cacheData));
@@ -1356,6 +1566,12 @@
             .th-form-group { margin-bottom: 12px; }
             .th-form-group label { display: block; margin-bottom: 5px; color: #374151; font-weight: 500; }
             .th-input, .th-select { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; box-sizing: border-box; }
+            #th-train-select { font-size: 13px; padding: 10px; }
+            #th-train-slider { height: 18px; }
+            #th-train-slider::-webkit-slider-runnable-track { height: 8px; border-radius: 4px; background: #d1d5db; }
+            #th-train-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #3b82f6; margin-top: -5px; }
+            #th-train-slider::-moz-range-track { height: 8px; border-radius: 4px; background: #d1d5db; }
+            #th-train-slider::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #3b82f6; border: none; }
             .th-btn {
                 width: 100%; padding: 10px; border: none; border-radius: 4px; color: white; font-weight: bold; cursor: pointer; transition: background 0.2s;
             }
@@ -1379,9 +1595,230 @@
                 fromStation: CONFIG.DEFAULTS.FROM_STATION_NAME, toStation: CONFIG.DEFAULTS.TO_STATION_NAME, trainDate: new Date().toISOString().split('T')[0],
                 trainCodes: [], seatTypes: [], passengers: [], startTime: ''
             },
-            passengersList: []
+            passengersList: [],
+            query: {
+                includePrevDay: CONFIG.QUERY.INCLUDE_PREV_DAY_DEFAULT,
+                candidateEnabled: CONFIG.CANDIDATE.ENABLED_DEFAULT,
+                trainOptions: {},
+                trainData: {},
+                allTrainOptions: [],
+                trainWindowStart: 0
+            }
         };
         let logContainer = null, onStartCallback = null, onStopCallback = null;
+
+        const TRAIN_WINDOW_SIZE = 14;
+
+        function normalizeStartTimeForInput(val) {
+            if (!val) return '';
+            const raw = String(val).trim();
+            if (!raw) return '';
+            if (raw.indexOf('T') !== -1) {
+                if (raw.length === 16) return raw + ':00';
+                return raw;
+            }
+            if (raw.indexOf('-') !== -1 && raw.indexOf(':') !== -1) {
+                const norm = raw.replace(' ', 'T');
+                if (norm.length === 16) return norm + ':00';
+                return norm;
+            }
+            if (raw.indexOf(':') !== -1) {
+                const today = new Date();
+                const y = today.getFullYear();
+                const m = String(today.getMonth() + 1).padStart(2, '0');
+                const d = String(today.getDate()).padStart(2, '0');
+                const parts = raw.split(':');
+                const hh = String(parts[0] || '00').padStart(2, '0');
+                const mm = String(parts[1] || '00').padStart(2, '0');
+                const ss = String(parts[2] || '00').padStart(2, '0');
+                return `${y}-${m}-${d}T${hh}:${mm}:${ss}`;
+            }
+            return '';
+        }
+
+        function setTrainControlsEnabled(enabled) {
+            const sel = document.getElementById('th-train-select');
+            const slider = document.getElementById('th-train-slider');
+            if (sel) sel.disabled = !enabled;
+            if (slider) slider.disabled = !enabled;
+        }
+
+        function setSeatControlsEnabled(enabled) {
+            const container = document.getElementById('th-seat-options');
+            if (!container) return;
+            const checks = container.querySelectorAll('input[type="checkbox"]');
+            checks.forEach(c => { c.disabled = !enabled; });
+        }
+
+        function formatDate(d) {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        }
+
+        function dateMinusDays(dateStr, days) {
+            const parts = String(dateStr || '').split('-').map(Number);
+            if (parts.length >= 3 && !Number.isNaN(parts[0]) && !Number.isNaN(parts[1]) && !Number.isNaN(parts[2])) {
+                const d = new Date(parts[0], parts[1] - 1, parts[2]);
+                d.setDate(d.getDate() - days);
+                return formatDate(d);
+            }
+            const d = new Date();
+            d.setDate(d.getDate() - days);
+            return formatDate(d);
+        }
+
+        function getDefaultSeatList() {
+            const text = (state.config.seatTypes && state.config.seatTypes.length > 0) ? state.config.seatTypes.join(',') : CONFIG.DEFAULTS.SEAT_TYPES_TEXT;
+            return String(text).split(/[,，]/).map(s => s.trim()).filter(Boolean);
+        }
+
+        function renderSeatOptionsFromTrain(train) {
+            const container = document.getElementById('th-seat-options');
+            if (!container) return;
+            if (!train || !train.tickets) {
+                container.innerHTML = '<span style="color:#999; font-size:12px;">请先查询并选择车次</span>';
+                return;
+            }
+
+            const seats = Object.keys(train.tickets).filter(k => String(train.tickets[k] || '') !== '');
+            const selected = new Set((state.config.seatTypes && state.config.seatTypes.length > 0) ? state.config.seatTypes : seats);
+            container.innerHTML = '';
+            seats.forEach(seat => {
+                const id = `th-seat-${seat}`;
+                const row = document.createElement('label');
+                row.style.display = 'inline-flex';
+                row.style.alignItems = 'center';
+                row.style.marginRight = '10px';
+                row.style.fontSize = '12px';
+                const stock = train.tickets[seat];
+                row.innerHTML = `<input type="checkbox" class="th-seat-check" value="${seat}" ${selected.has(seat) ? 'checked' : ''} style="margin-right:4px;">${seat}(${stock})`;
+                container.appendChild(row);
+            });
+        }
+
+        function renderTrainOptionsWindow(startIndex) {
+            const select = document.getElementById('th-train-select');
+            if (!select) return;
+            select.innerHTML = '';
+
+            const options = state.query.allTrainOptions || [];
+            const start = Math.max(0, Math.min(startIndex || 0, Math.max(0, options.length - TRAIN_WINDOW_SIZE)));
+            const end = Math.min(options.length, start + TRAIN_WINDOW_SIZE);
+            state.query.trainWindowStart = start;
+
+            for (let i = start; i < end; i++) {
+                const t = options[i];
+                const key = `${t.queryDate}|${t.trainCode}`;
+                const op = document.createElement('option');
+                op.value = key;
+
+                const s2 = t.tickets && typeof t.tickets['二等座'] !== 'undefined' ? t.tickets['二等座'] : '';
+                const s1 = t.tickets && typeof t.tickets['一等座'] !== 'undefined' ? t.tickets['一等座'] : '';
+                const sw = t.tickets && typeof t.tickets['商务座'] !== 'undefined' ? t.tickets['商务座'] : '';
+                op.textContent = `${t.queryDate} ${t.trainCode} ${t.startTime}-${t.endTime} ${t.duration} 二等:${s2} 一等:${s1} 商务:${sw}`;
+                select.appendChild(op);
+            }
+
+            if (options.length === 0) {
+                const op = document.createElement('option');
+                op.value = '';
+                op.disabled = true;
+                op.textContent = '暂无车次，请先查询';
+                select.appendChild(op);
+            }
+
+            const slider = document.getElementById('th-train-slider');
+            const label = document.getElementById('th-train-slider-label');
+            if (slider) {
+                slider.min = '0';
+                slider.max = String(Math.max(0, options.length - TRAIN_WINDOW_SIZE));
+                slider.value = String(start);
+                slider.step = '1';
+            }
+            if (label) {
+                if (options.length === 0) label.textContent = '';
+                else label.textContent = `滑动选择范围：${start + 1}-${end} / ${options.length}`;
+            }
+        }
+
+        function renderTrainOptions(options) {
+            state.query.trainOptions = {};
+            state.query.trainData = {};
+            state.query.allTrainOptions = options || [];
+
+            for (let i = 0; i < state.query.allTrainOptions.length; i++) {
+                const t = state.query.allTrainOptions[i];
+                const key = `${t.queryDate}|${t.trainCode}`;
+                state.query.trainOptions[key] = { trainDate: t.queryDate, trainCode: t.trainCode };
+                state.query.trainData[key] = t;
+            }
+
+            renderTrainOptionsWindow(0);
+
+            const select = document.getElementById('th-train-select');
+            if (select) {
+                select.value = '';
+            }
+            renderSeatOptionsFromTrain(null);
+            setSeatControlsEnabled(false);
+        }
+
+        function getSelectedTrain() {
+            const select = document.getElementById('th-train-select');
+            if (!select) return null;
+            const key = select.value;
+            if (!key) return null;
+            return state.query.trainData[key] || null;
+        }
+
+        async function queryTrains() {
+            const date = document.getElementById('th-date').value;
+            const fromName = document.getElementById('th-from').value.trim();
+            const toName = document.getElementById('th-to').value.trim();
+
+            const from = stationMap[fromName] || fromName;
+            const to = stationMap[toName] || toName;
+
+            if (!from || !to) {
+                log('请填写出发站/到达站', 'warn');
+                return;
+            }
+            if (!/^[A-Z]+$/.test(from) || !/^[A-Z]+$/.test(to)) {
+                log('站点未能转换为简码，请从下拉建议选择或直接输入简码', 'warn');
+            }
+
+            const includePrev = document.getElementById('th-include-prev-day').checked;
+            const dates = [date];
+            if (includePrev) {
+                dates.unshift(dateMinusDays(date, 1));
+            }
+
+            log(`开始查询车次: ${fromName}->${toName} ${dates.join(', ')}`, 'info');
+            const reqs = dates.map(d => NetworkModule.queryTickets(d, from, to));
+            const resList = await Promise.allSettled(reqs);
+
+            const options = [];
+            for (let i = 0; i < resList.length; i++) {
+                const d = dates[i];
+                const item = resList[i];
+                if (item.status !== 'fulfilled') continue;
+                const res = item.value;
+                if (res && res.status && res.data && Array.isArray(res.data.result)) {
+                    for (let j = 0; j < res.data.result.length; j++) {
+                        const raw = res.data.result[j];
+                        const parsed = TicketLogicModule._parseTrainInfo(raw);
+                        if (!parsed) continue;
+                        options.push({ queryDate: d, ...parsed });
+                    }
+                }
+            }
+
+            renderTrainOptions(options);
+            log(`查询完成，得到 ${options.length} 个车次`, 'success');
+            setTrainControlsEnabled(true);
+        }
 
         /**
          * @description 创建并插入 UI 面板到页面
@@ -1397,7 +1834,12 @@
             const cachedConfig = CacheModule.loadCache();
             if (cachedConfig) {
                 state.config = { ...state.config, ...cachedConfig };
+                if (cachedConfig.fromStationName) state.config.fromStation = cachedConfig.fromStationName;
+                if (cachedConfig.toStationName) state.config.toStation = cachedConfig.toStationName;
+                if (typeof cachedConfig.candidateEnabled === 'boolean') state.query.candidateEnabled = cachedConfig.candidateEnabled;
             }
+
+            const startTimeValue = normalizeStartTimeForInput(state.config.startTime);
 
             const panel = document.createElement('div');
             panel.id = 'ticket-helper-panel';
@@ -1413,20 +1855,32 @@
                     </div>
                     <div class="th-form-group">
                         <label>定时抢票 (可选)</label>
-                        <input type="time" class="th-input" id="th-start-time" step="1" value="${state.config.startTime || ''}">
+                        <input type="datetime-local" class="th-input" id="th-start-time" step="1" value="${startTimeValue}">
                         <div style="font-size:12px; color:#666; margin-top:2px;">设置后将在指定时间自动开始抢票</div>
                     </div>
                     <div class="th-form-group" style="display:flex; gap:10px;">
-                        <div style="flex:1"><label>出发站 (中文)</label><input type="text" class="th-input" id="th-from" value="${state.config.fromStation}" placeholder="${CONFIG.DEFAULTS.FROM_STATION_PLACEHOLDER}"></div>
-                        <div style="flex:1"><label>到达站 (中文)</label><input type="text" class="th-input" id="th-to" value="${state.config.toStation}" placeholder="${CONFIG.DEFAULTS.TO_STATION_PLACEHOLDER}"></div>
+                        <div style="flex:1"><label>出发站 (中文)</label><input type="text" class="th-input" id="th-from" list="th-station-datalist" value="${state.config.fromStation}" placeholder="${CONFIG.DEFAULTS.FROM_STATION_PLACEHOLDER}"></div>
+                        <div style="flex:1"><label>到达站 (中文)</label><input type="text" class="th-input" id="th-to" list="th-station-datalist" value="${state.config.toStation}" placeholder="${CONFIG.DEFAULTS.TO_STATION_PLACEHOLDER}"></div>
                     </div>
                     <div class="th-form-group">
-                        <label>目标车次 (英文逗号分隔)</label>
-                        <input type="text" class="th-input" id="th-trains" placeholder="${CONFIG.DEFAULTS.TRAIN_CODES_PLACEHOLDER}" value="${state.config.trainCodes.join(',')}">
+                        <div style="display:flex; align-items:center; gap:10px;">
+                            <button id="th-query-trains" style="padding:6px 8px; font-size:12px;">查询车次</button>
+                            <label style="display:inline-flex; align-items:center; font-size:12px;"><input type="checkbox" id="th-include-prev-day" ${state.query.includePrevDay ? 'checked' : ''} style="margin-right:4px;">包含前一天</label>
+                            <label style="display:inline-flex; align-items:center; font-size:12px;"><input type="checkbox" id="th-enable-candidate" ${state.query.candidateEnabled ? 'checked' : ''} style="margin-right:4px;">允许候补</label>
+                        </div>
+                        <div style="font-size:12px; color:#666; margin-top:4px;">先查询，再从列表选择车次；避免手动填写错误</div>
                     </div>
                     <div class="th-form-group">
-                        <label>席别优先 (英文逗号分隔)</label>
-                        <input type="text" class="th-input" id="th-seats" value="${state.config.seatTypes.length > 0 ? state.config.seatTypes.join(',') : CONFIG.DEFAULTS.SEAT_TYPES_TEXT}" placeholder="${CONFIG.DEFAULTS.SEAT_TYPES_TEXT}">
+                        <label>选择车次</label>
+                        <select class="th-select" id="th-train-select" size="10"></select>
+                        <div style="margin-top:4px;">
+                            <input type="range" id="th-train-slider" min="0" max="0" value="0" step="1" style="width:100%;">
+                            <div id="th-train-slider-label" style="font-size:12px; color:#666; margin-top:2px;"></div>
+                        </div>
+                    </div>
+                    <div class="th-form-group">
+                        <label>席别优先 (可多选)</label>
+                        <div id="th-seat-options" style="border:1px solid #eee; padding:6px; border-radius:4px;"></div>
                     </div>
                     <div class="th-form-group">
                         <label>乘车人 (需先登录)</label>
@@ -1438,11 +1892,33 @@
                     <button id="th-action-btn" class="th-btn th-btn-primary">开始抢票</button>
                     <div class="th-log-area" id="th-logs"><div class="th-log-entry th-log-info">面板已就绪...</div></div>
                 </div>
+                <datalist id="th-station-datalist"></datalist>
             `;
             document.body.appendChild(panel);
             bindEvents();
             makeDraggable(panel);
             logContainer = document.getElementById('th-logs');
+
+            renderSeatOptionsFromTrain(null);
+            renderTrainOptions([]);
+            setTrainControlsEnabled(false);
+            setSeatControlsEnabled(false);
+
+            window.__th_update_station_list = () => {
+                const dl = document.getElementById('th-station-datalist');
+                if (!dl) return;
+                const names = Object.keys(stationMap || {});
+                if (!names || names.length === 0) return;
+                dl.innerHTML = '';
+                for (let i = 0; i < names.length; i++) {
+                    const op = document.createElement('option');
+                    op.value = names[i];
+                    dl.appendChild(op);
+                }
+            };
+            if (typeof window.__th_update_station_list === 'function') {
+                window.__th_update_station_list();
+            }
 
             // 恢复缓存的乘客选择
             if (cachedConfig && cachedConfig.passengers && cachedConfig.passengers.length > 0) {
@@ -1456,6 +1932,24 @@
         function bindEvents() {
             document.getElementById('th-action-btn').addEventListener('click', () => {
                 state.isRunning ? stop() : start();
+            });
+            document.getElementById('th-query-trains').addEventListener('click', async () => {
+                try {
+                    await queryTrains();
+                } catch (e) {
+                    log('查询车次失败: ' + (e && e.message ? e.message : String(e)), 'error');
+                }
+            });
+
+            document.getElementById('th-train-slider').addEventListener('input', (e) => {
+                const v = parseInt(e.target.value, 10);
+                renderTrainOptionsWindow(Number.isNaN(v) ? 0 : v);
+            });
+
+            document.getElementById('th-train-select').addEventListener('change', () => {
+                const t = getSelectedTrain();
+                renderSeatOptionsFromTrain(t);
+                setSeatControlsEnabled(!!t);
             });
             document.getElementById('th-refresh-passengers').addEventListener('click', async () => {
                 log('正在获取乘客列表...', 'info');
@@ -1532,9 +2026,21 @@
             const from = stationMap[fromName] || fromName;
             const to = stationMap[toName] || toName;
 
-            const trains = document.getElementById('th-trains').value.split(/[,，]/).map(s => s.trim()).filter(s => s);
-            const seats = document.getElementById('th-seats').value.split(/[,，]/).map(s => s.trim()).filter(s => s);
+            const trainSelect = document.getElementById('th-train-select');
+            const selectedKey = trainSelect ? String(trainSelect.value || '') : '';
+            const trains = [];
+            let selectedDate = null;
+            if (selectedKey) {
+                const meta = state.query.trainOptions[selectedKey];
+                if (meta) {
+                    selectedDate = meta.trainDate;
+                    trains.push(meta.trainCode);
+                }
+            }
+
+            const seats = Array.from(document.querySelectorAll('#th-seat-options .th-seat-check:checked')).map(el => el.value).filter(Boolean);
             const startTime = document.getElementById('th-start-time').value;
+            const candidateEnabled = !!document.getElementById('th-enable-candidate').checked;
 
             const selectedPassengers = [];
             document.querySelectorAll('#th-passenger-list .th-p-check:checked').forEach(checkbox => {
@@ -1547,7 +2053,7 @@
                 }
                 selectedPassengers.push(passengerData);
             });
-            return { trainDate: date, fromStation: from, toStation: to, trainCodes: trains, seatTypes: seats, passengers: selectedPassengers, startTime: startTime };
+            return { trainDate: selectedDate || date, fromStation: from, toStation: to, trainCodes: trains, seatTypes: seats, passengers: selectedPassengers, startTime: startTime, candidateEnabled, fromStationName: fromName, toStationName: toName };
         }
 
         /**
@@ -1555,7 +2061,8 @@
          */
         function start() {
             const config = getConfig();
-            if (config.trainCodes.length === 0) return log('请输入目标车次', 'warn');
+            if (config.trainCodes.length === 0) return log('请先点击“查询车次”，并在列表中选择车次', 'warn');
+            if (config.seatTypes.length === 0) return log('请选择至少一个席别', 'warn');
             if (config.passengers.length === 0) return log('请选择至少一位乘车人', 'warn');
             state.config = config;
             state.isRunning = true;
@@ -1734,9 +2241,13 @@
         // 如果设置了定时抢票，且时间未到，则进入倒计时模式
         if (startTime) {
             const serverNow = getServerTime();
-            const [h, m, s] = startTime.split(':').map(Number);
-            const targetTime = new Date(serverNow);
-            targetTime.setHours(h, m, s || 0, 0);
+            const targetMs = DebugModule.computeTargetServerMs(startTime, serverNow);
+            if (typeof targetMs !== 'number') {
+                UIModule.log('定时格式不正确，立即开始抢票', 'warn');
+                executeTask(config);
+                return;
+            }
+            const targetTime = new Date(targetMs);
 
             // 如果目标时间已过，假设是明天的这个时间（或者直接开始？这里逻辑取直接开始，或者提示用户）
             // 通常抢票场景是当天稍晚的时间。如果设置的时间已经过去了，就直接开始吧，或者提示警告。
@@ -1785,9 +2296,13 @@
                     }
 
                     if (CONFIG.TIME_SYNC && typeof CONFIG.TIME_SYNC.RESYNC_EVERY_MS === 'number' && CONFIG.TIME_SYNC.RESYNC_EVERY_MS > 0) {
+                        const fastWithin = (CONFIG.TIME_SYNC && typeof CONFIG.TIME_SYNC.RESYNC_FAST_WITHIN_MS === 'number') ? CONFIG.TIME_SYNC.RESYNC_FAST_WITHIN_MS : null;
+                        const fastEvery = (CONFIG.TIME_SYNC && typeof CONFIG.TIME_SYNC.RESYNC_FAST_EVERY_MS === 'number') ? CONFIG.TIME_SYNC.RESYNC_FAST_EVERY_MS : null;
+                        const baseEvery = CONFIG.TIME_SYNC.RESYNC_EVERY_MS;
+                        const every = (typeof fastWithin === 'number' && typeof fastEvery === 'number' && diff <= fastWithin) ? fastEvery : baseEvery;
                         if (Date.now() >= nextResyncAt && diff > CONFIG.COUNTDOWN.SPIN_WITHIN_MS) {
                             syncServerTime();
-                            nextResyncAt = Date.now() + CONFIG.TIME_SYNC.RESYNC_EVERY_MS;
+                            nextResyncAt = Date.now() + every;
                         }
                     }
 
@@ -1871,10 +2386,9 @@
 
         // 如果设置了定时抢票，根据距离开售时间动态调整
         if (config.startTime) {
-            const [h, m, s] = config.startTime.split(':').map(Number);
-            const target = new Date(now);
-            target.setHours(h, m, s || 0, 0);
-            const diff = target.getTime() - now.getTime();
+            const targetMs = DebugModule.computeTargetServerMs(config.startTime, now);
+            const diff = (typeof targetMs === 'number') ? (targetMs - now.getTime()) : null;
+            if (typeof diff !== 'number') return delay;
 
             if (diff > CONFIG.POLLING.IDLE_DIFF_GT_MS) {
                 // 闲时模式：距离开售 > 10s，每 10s 查一次
@@ -1896,6 +2410,152 @@
 
         return delay;
     }
+
+    const CandidateOrderModule = (() => {
+        const SEAT_TYPE_CODE = {
+            '商务座': '9', '特等座': 'P', '一等座': 'M', '二等座': 'O',
+            '高级软卧': '6', '软卧': '4', '硬卧': '3', '硬座': '1', '无座': '1'
+        };
+
+        function buildSecretList(secretStr, seatCode) {
+            const code = (seatCode === undefined || seatCode === null || seatCode === '') ? '1' : String(seatCode);
+            return `${secretStr}#${code}|`;
+        }
+
+        function getSeatCodeFromConfig(seatTypes) {
+            if (!seatTypes || seatTypes.length === 0) return '1';
+            const seatName = seatTypes[0];
+            const code = SEAT_TYPE_CODE[seatName];
+            return code || '1';
+        }
+
+        function buildPassengerInfo(passengers) {
+            const parts = [];
+            for (let i = 0; i < passengers.length; i++) {
+                const p = passengers[i];
+                let ticketType = '1';
+                if ((p.passenger_type || p.passenger_type_name) && ((p.passenger_type == '3') || (p.passenger_type_name === '学生'))) {
+                    ticketType = p.isStudentTicket ? '3' : '1';
+                }
+                const name = p.passenger_name || '';
+                const idType = p.passenger_id_type_code || '';
+                const idNo = p.passenger_id_no || '';
+                const enc = p.allEncStr || '';
+                parts.push(`${ticketType}#${name}#${idType}#${idNo}#${enc}#0;`);
+            }
+            return parts.join('');
+        }
+
+        function ymdFromAny(trainDate, fallbackYmd) {
+            const s = String(trainDate || '').replace(/[^0-9]/g, '');
+            if (s.length === 8) return s;
+            const f = String(fallbackYmd || '').replace(/[^0-9]/g, '');
+            if (f.length === 8) return f;
+            return '';
+        }
+
+        function hhmmFromTimeStr(timeStr) {
+            const m = String(timeStr || '').match(/^(\d{1,2}):(\d{2})/);
+            if (!m) return '';
+            const hh = m[1].padStart(2, '0');
+            const mm = m[2];
+            return `${hh}${mm}`;
+        }
+
+        function extractParams(...responses) {
+            const out = {};
+            const keys = ['jzParam', 'hbTrain', 'lkParam', 'sessionId', 'sig', 'scene', 'encryptedData'];
+            for (let i = 0; i < responses.length; i++) {
+                const r = responses[i];
+                if (!r) continue;
+                const candidates = [];
+                if (r.data && typeof r.data === 'object') candidates.push(r.data);
+                if (r.data && r.data.data && typeof r.data.data === 'object') candidates.push(r.data.data);
+                if (typeof r === 'object') candidates.push(r);
+                for (let j = 0; j < candidates.length; j++) {
+                    const obj = candidates[j];
+                    if (!obj || typeof obj !== 'object') continue;
+                    for (let k = 0; k < keys.length; k++) {
+                        const key = keys[k];
+                        if (typeof out[key] === 'string' && out[key]) continue;
+                        if (typeof obj[key] === 'string' && obj[key]) out[key] = obj[key];
+                    }
+                }
+            }
+            return out;
+        }
+
+        async function executeCandidateSequence(candidateTrain, passengers, config) {
+            const seatCode = getSeatCodeFromConfig(config.seatTypes);
+            const secretList = buildSecretList(candidateTrain.secretStr, seatCode);
+            const passengerInfo = buildPassengerInfo(passengers);
+
+            const step1 = await NetworkModule.submitOrderRequestHb(secretList);
+            if (!step1 || step1.status === false) {
+                return { success: false, error: step1 ? (step1.msg || 'submitOrderRequestHb failed') : 'submitOrderRequestHb failed' };
+            }
+
+            const step2 = await NetworkModule.chechFace(secretList);
+            if (!step2 || step2.status === false) {
+                return { success: false, error: step2 ? (step2.msg || 'chechFace failed') : 'chechFace failed' };
+            }
+
+            const stepInit = await NetworkModule.passengerInitApi();
+
+            const dyn = extractParams(step1, step2, stepInit);
+
+            let step3 = await NetworkModule.confirmHB({
+                passengerInfo,
+                jzParam: dyn.jzParam,
+                hbTrain: dyn.hbTrain,
+                lkParam: dyn.lkParam,
+                sessionId: dyn.sessionId,
+                sig: dyn.sig,
+                scene: dyn.scene,
+                encryptedData: dyn.encryptedData,
+                realize_limit_time_diff: '360',
+                add_train_flag: 'N'
+            });
+
+            if (!step3 || step3.status === false) {
+                const ymd = ymdFromAny(candidateTrain.trainDate, config.trainDate);
+                const hm = hhmmFromTimeStr(candidateTrain.startTime);
+                if (ymd && hm) {
+                    step3 = await NetworkModule.confirmHB({
+                        passengerInfo,
+                        jzParam: dyn.jzParam,
+                        hbTrain: dyn.hbTrain,
+                        lkParam: dyn.lkParam,
+                        sessionId: dyn.sessionId,
+                        sig: dyn.sig,
+                        scene: dyn.scene,
+                        encryptedData: dyn.encryptedData,
+                        realize_limit_time_diff: '10080',
+                        add_train_flag: 'Y',
+                        tmp_train_date: `${ymd}#`,
+                        tmp_train_time: `${hm}#`,
+                        add_train_seat_type_code: String(seatCode)
+                    });
+                }
+            }
+
+            if (!step3 || step3.status === false) {
+                return { success: false, error: step3 ? (step3.msg || 'confirmHB failed') : 'confirmHB failed' };
+            }
+
+            const pollStart = Date.now();
+            while (Date.now() - pollStart < 15000) {
+                const q = await NetworkModule.queryQueue();
+                if (q && q.status === true) {
+                    return { success: true, data: q };
+                }
+                await new Promise(r => setTimeout(r, 800));
+            }
+            return { success: true, data: step3 };
+        }
+
+        return { executeCandidateSequence };
+    })();
 
     /**
      * @description 执行具体的抢票逻辑 (轮询查票 -> 下单)
@@ -1925,6 +2585,7 @@
         }
 
         let hasFoundTicket = false;
+        let hasFoundCandidate = false;
         let lastStatusLogAt = 0;
 
         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -1932,11 +2593,10 @@
         const getWorkerCount = () => {
             if (!startTime) return CONFIG.WORKER.NORMAL_COUNT;
             const now = getServerTime();
-            const [h, m, s] = startTime.split(':').map(Number);
-            const target = new Date(now);
-            target.setHours(h, m, s || 0, 0);
-            const diff = target.getTime() - now.getTime();
-            if (diff <= CONFIG.WORKER.CRITICAL_WINDOW_MS && diff >= -CONFIG.WORKER.CRITICAL_WINDOW_MS) return CONFIG.WORKER.CRITICAL_COUNT;
+            const targetMs = DebugModule.computeTargetServerMs(startTime, now);
+            const diff = (typeof targetMs === 'number') ? (targetMs - now.getTime()) : null;
+            if (typeof diff !== 'number') return CONFIG.WORKER.NORMAL_COUNT;
+            if (diff <= CONFIG.WORKER.BURST_WITHIN_MS) return CONFIG.WORKER.BURST_COUNT;
             return CONFIG.WORKER.NORMAL_COUNT;
         };
 
@@ -1976,10 +2636,15 @@
 
                     if (queryRes && queryRes.status && queryRes.data && queryRes.data.result) {
                         let targetTrain = null;
+                        let candidateTrain = null;
                         for (let i = 0; i < trainCodes.length; i++) {
                             const code = trainCodes[i];
                             const train = TicketLogicModule.findTargetTrain(queryRes.data.result, code, seatTypes);
                             if (train) { targetTrain = train; break; }
+                            if (!candidateTrain && config.candidateEnabled) {
+                                const cand = TicketLogicModule.findCandidateTrain(queryRes.data.result, code, seatTypes);
+                                if (cand) candidateTrain = cand;
+                            }
                         }
 
                         if (targetTrain) {
@@ -2020,6 +2685,35 @@
                                     }, CONFIG.RETRY.RESTART_AFTER_MS);
                                 }
                             });
+                            return;
+                        }
+
+                        if (!hasFoundCandidate && config.candidateEnabled && candidateTrain) {
+                            hasFoundCandidate = true;
+                            isChecking = false;
+                            UIModule.log(`未发现余票，但可候补: ${candidateTrain.trainCode} (${candidateTrain.seatName}) ${candidateTrain.stockStr}`, 'warn');
+                            UIModule.log('尝试自动提交候补...', 'info');
+                            try {
+                                const r = await CandidateOrderModule.executeCandidateSequence(candidateTrain, passengers, config);
+                                if (r && r.success) {
+                                    UIModule.log('候补提交请求已发送（请在 12306 查看候补订单状态）', 'success');
+                                    stopTask();
+                                    return;
+                                }
+                                UIModule.log(`候补自动提交失败: ${r ? r.error : 'Unknown'}`, 'error');
+                            } catch (e) {
+                                UIModule.log(`候补自动提交异常: ${e && e.message ? e.message : String(e)}`, 'error');
+                            }
+
+                            UIModule.log('将回退为打开 12306 官方页面进行候补操作', 'warn');
+                            try {
+                                const fsName = config.fromStationName || '';
+                                const tsName = config.toStationName || '';
+                                const url = `${CONFIG.URL.LEFT_TICKET_INIT}?linktypeid=dc&fs=${encodeURIComponent(fsName)}&ts=${encodeURIComponent(tsName)}&date=${encodeURIComponent(config.trainDate)}`;
+                                window.open(url, '_blank');
+                            } catch (e) {
+                            }
+                            stopTask();
                             return;
                         }
                     }
